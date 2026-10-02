@@ -97,6 +97,16 @@ fails loudly during practice.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class FinalIssue:
+    """A diagnostic for the model to repair; never replacement evidence."""
+
+    code: str
+    message: str
+
 
 class Middleware:
     """Base class for a harness layer. Every hook is a no-op by default.
@@ -180,6 +190,15 @@ class Middleware:
         does, never what the scorer believes the model said.
         """
         return response
+
+    def review_final(self, ctx, report):
+        """Optional, read-only review before accepting a model's FINAL.
+
+        The six original lifecycle hooks retain their ordering. Reviewers
+        return FinalIssue objects; only the model writes the next FINAL.
+        after_agent still runs exactly once, at submission.
+        """
+        return ()
 
     # -- once per tool call --------------------------------------------
 
@@ -287,6 +306,26 @@ class MiddlewareStack:
 
     def __iter__(self):
         return iter(self.middleware)
+
+    @property
+    def has_final_review(self):
+        return any(type(layer).review_final is not Middleware.review_final
+                   for layer in self.middleware)
+
+    def review_final(self, ctx, report):
+        # Isolate each reviewer from the model payload and other reviewers.
+        # A programming error remains visible, like errors in the six hooks.
+        from copy import deepcopy
+        issues, seen = [], set()
+        for layer in reversed(self.middleware):
+            found = layer.review_final(ctx, deepcopy(report))
+            if not isinstance(found, (tuple, list)) or not all(isinstance(i, FinalIssue) for i in found):
+                raise TypeError(f"{layer.label}.review_final must return a sequence of FinalIssue")
+            for issue in found:
+                if issue.code not in seen:
+                    issues.append(issue)
+                    seen.add(issue.code)
+        return tuple(issues)
 
     # -- straight passes -----------------------------------------------
 

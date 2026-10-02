@@ -64,16 +64,19 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import time
+
 from arena.model import FINALIZE_SENTINEL
-from arena.tools import ToolResult  # noqa: F401  (dùng trong phần TODO)
+from arena.tools import ToolResult
 
 from harness.middleware import Middleware
+from harness.layers._resources import finite_limit, tool_budget_spent
 
 #: Dành lại cho lượt `submit` mà agent vẫn còn phải gọi.
 DEFAULT_RESERVE = 1
 
 NUDGE = (
-    "Ngân sách công cụ đã hết. Hãy trả lời ngay bằng bằng chứng đang có, "
+    "Dành ngân sách còn lại để kết luận. Hãy trả lời ngay bằng bằng chứng đang có, "
     f"không gọi thêm công cụ nào nữa. {FINALIZE_SENTINEL}"
 )
 
@@ -83,27 +86,80 @@ class BudgetPolicy(Middleware):
 
     name = "budget_policy"
 
-    def __init__(self, reserve: int = DEFAULT_RESERVE) -> None:
+    def __init__(self, reserve: int = DEFAULT_RESERVE, *, reserve_tokens=512, clock=None) -> None:
         self.reserve = max(0, int(reserve))
+        self.reserve_tokens = max(0, int(reserve_tokens))
+        self.clock = clock if clock is not None else time.monotonic
+
+    def before_agent(self, ctx):
+        started = self.clock()
+        seconds = finite_limit(ctx.budget.get("max_seconds"))
+        ctx.state["budget.started"] = started
+        ctx.state["budget.clock"] = self.clock
+        ctx.state["budget.deadline"] = (started + seconds - min(1.0, seconds * 0.1)
+                                        if seconds is not None else None)
+        ctx.state["budget.reserve"] = self.reserve
+        ctx.state["budget.reserve_tokens"] = self.reserve_tokens
+        ctx.state["budget.tokens"] = 0
+        ctx.state["budget.prompt_chars"] = 0
+        ctx.state["budget.prompt_tokens"] = 0
+        ctx.state["budget.finalizing"] = False
+
+    def _reason(self, ctx):
+        if ctx.state.get("budget.finalizing"):
+            return ctx.state.get("budget.reason", "tool_calls")
+        if tool_budget_spent(ctx, self.reserve):
+            return "tool_calls"
+        limit = finite_limit(ctx.budget.get("max_tokens"))
+        if limit is not None and ctx.state.get("budget.tokens", 0) >= limit - self.reserve_tokens:
+            return "tokens"
+        seconds = finite_limit(ctx.budget.get("max_seconds"))
+        started = ctx.state.get("budget.started")
+        if seconds is not None and started is not None:
+            if self.clock() - started >= seconds - min(1.0, seconds * 0.1):
+                return "time"
+        return ""
 
     def _spent(self, ctx) -> bool:
-        # TODO (§3): 2 dòng — "ngân sách đã cạn đến phần dự trữ chưa?"
-        #  limit = ctx.max_tool_calls; None nghĩa là brief không đặt ngân
-        #  sách -> chưa bao giờ cạn. Ngược lại:
-        #  ctx.tools.calls >= limit - self.reserve
-        return False
+        return bool(self._reason(ctx))
 
     def before_model(self, ctx, messages):
-        # TODO (§3): khoảng 4-6 dòng.
-        #  1. Nếu chưa cạn (`not self._spent(ctx)`) -> trả messages nguyên vẹn.
-        #  2. Ngược lại: trả về messages + [{"role": "user", "content": NUDGE}]
-        return messages  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        reason = self._reason(ctx)
+        chars = sum(len(m.get("content", "")) for m in messages
+                    if isinstance(m, dict) and isinstance(m.get("content"), str))
+        previous_chars = ctx.state.get("budget.prompt_chars", 0)
+        previous_tokens = ctx.state.get("budget.prompt_tokens", 0)
+        limit = finite_limit(ctx.budget.get("max_tokens"))
+        if not reason and limit is not None and previous_chars and previous_tokens:
+            # Calibrate to actual endpoint usage (Vietnamese differs from
+            # chars/4). Preserve the full evidence; finalize before a new
+            # retrieval would leave too little for the following FINAL.
+            estimate = max(previous_tokens, int(chars * previous_tokens / previous_chars)) + 128
+            if ctx.state.get("budget.tokens", 0) + 2 * estimate + self.reserve_tokens > limit:
+                reason = "tokens_forecast"
+        ctx.state["budget.prompt_chars"] = chars
+        if not reason:
+            return messages
+        ctx.state["budget.finalizing"] = True
+        ctx.state["budget.reason"] = reason
+        if any(FINALIZE_SENTINEL in m.get("content", "")
+               for m in messages if isinstance(m, dict) and isinstance(m.get("content"), str)):
+            return messages
+        # Keep every observation intact; a one-turn nudge, no fabricated FINAL.
+        return messages + [{"role": "user", "content": NUDGE}]
+
+    def after_model(self, ctx, response):
+        ctx.state["budget.prompt_tokens"] = finite_limit(getattr(response, "prompt_tokens", None)) or 0
+        usage = sum(finite_limit(getattr(response, name, None)) or 0
+                    for name in ("prompt_tokens", "completion_tokens"))
+        ctx.state["budget.tokens"] = ctx.state.get("budget.tokens", 0) + usage
+        return response
 
     def wrap_tool_call(self, ctx, call, name, args):
-        # TODO (§3): khoảng 4-6 dòng.
-        #  1. Nếu chưa cạn -> `return call(name, args)` như bình thường.
-        #  2. Nếu đã cạn -> ĐỪNG gọi `call(...)`, trả về
-        #     ToolResult(ok=False, content="", error="<lý do>").
-        #     Không calling through chính là cách một lớp middleware
-        #     "chặn" một hành động — xem harness/middleware.py.
-        return call(name, args)  # <- mặc định KHÔNG LÀM GÌ
+        reason = self._reason(ctx)
+        if reason:
+            ctx.state["budget.finalizing"] = True
+            ctx.state["budget.reason"] = reason
+            ctx.state["budget.blocked"] = ctx.state.get("budget.blocked", 0) + 1
+            return ToolResult(ok=False, content="", error=f"Hết ngân sách ({reason}); hãy chốt FINAL.")
+        return call(name, args)

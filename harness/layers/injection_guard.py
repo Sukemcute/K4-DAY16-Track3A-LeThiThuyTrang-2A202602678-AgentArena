@@ -47,12 +47,73 @@ nên lớp cần "chốt hạ" cuối cùng phải đứng đầu tiên.
 
 from __future__ import annotations
 
+import json
+import re
+
+from arena.corpus import INJECTION_CANARY
+from arena.tools import ToolResult
 from harness.middleware import Middleware
+from harness.layers._evidence import citations, json_payload, remember_result
 
 #: Dấu mốc của đoạn nội dung không đáng tin trong kho tài liệu.
 BLOCK_START = "--- LƯU Ý HỆ THỐNG"
 BLOCK_END = "--- HẾT LƯU Ý HỆ THỐNG ---"
 PLACEHOLDER = "[nội dung không đáng tin cậy đã bị loại bỏ]"
+
+_BLOCK = re.compile(
+    r"---[ \t]+(?P<end>HẾT[ \t]+)?LƯU[ \t]+Ý[ \t]+HỆ[ \t]+THỐNG(?:[ \t]+---)?",
+    re.IGNORECASE,
+)
+_ROLE_BLOCK = re.compile(
+    r"<(?P<role>system|developer)>.*?(?:</(?P=role)>|\Z)"
+    r"|<\|im_start\|>(?:system|developer).*?(?:<\|im_end\|>|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+_DIRECTIVE = re.compile(
+    r"^[ \t]*(?:ignore (?:all |the )?(?:previous|prior|above) instructions"
+    r"|disregard (?:all |the )?(?:previous|prior|above) instructions"
+    r"|bỏ qua (?:tất cả |mọi )?(?:chỉ dẫn|hướng dẫn|lệnh) (?:trước|ở trên)).*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def sanitize_text(text):
+    """Remove nested/missing-end blocks without altering safe quote text."""
+    parts, cursor, depth, opening = [], 0, 0, 0
+    for marker in _BLOCK.finditer(text):
+        if marker.group("end"):
+            if depth:
+                depth -= 1
+                if depth == 0:
+                    parts.extend((text[cursor:opening], PLACEHOLDER))
+                    cursor = marker.end()
+        else:
+            if depth == 0:
+                opening = marker.start()
+            depth += 1
+    if depth:
+        parts.extend((text[cursor:opening], PLACEHOLDER))
+    else:
+        parts.append(text[cursor:])
+    cleaned = "".join(parts)
+    cleaned = _ROLE_BLOCK.sub(PLACEHOLDER, cleaned)
+    cleaned = _DIRECTIVE.sub(PLACEHOLDER, cleaned)
+    return cleaned.replace(INJECTION_CANARY, "")
+
+
+def _scrub(value, depth=0):
+    # Parsed model/tool JSON cannot contain cycles, but adversarial depth is
+    # still bounded. Claim text takes a separate delete-only path below.
+    if depth > 32:
+        return None
+    if isinstance(value, str):
+        return sanitize_text(value)
+    if isinstance(value, list):
+        return [_scrub(item, depth + 1) for item in value]
+    if isinstance(value, dict):
+        return {sanitize_text(key): _scrub(item, depth + 1)
+                for key, item in value.items() if isinstance(key, str)}
+    return value
 
 
 class InjectionGuard(Middleware):
@@ -62,17 +123,45 @@ class InjectionGuard(Middleware):
 
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§10): khoảng 8-15 dòng.
-        #  1. Nếu BLOCK_START không có trong result.content -> trả về result.
-        #  2. Cắt từ BLOCK_START tới hết BLOCK_END, thay bằng PLACEHOLDER.
-        #     Nếu KHÔNG tìm thấy BLOCK_END (fetch bị cắt giữa chừng) thì
-        #     cắt từ BLOCK_START tới hết chuỗi.
-        #  3. Lặp lại cho tới khi không còn BLOCK_START nào.
-        #  4. Trả về ToolResult(ok=result.ok, content=<đã sạch>, error=result.error).
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not isinstance(result.content, str):
+            return ToolResult(ok=False, content="", error="invalid tool payload: expected text")
+        payload = json_payload(result.content) if name == "search" else None
+        if payload is not None:
+            clean_payload = _scrub(payload)
+            content = (result.content if clean_payload == payload else
+                       json.dumps(clean_payload, ensure_ascii=False))
+        else:
+            content = sanitize_text(result.content)
+        error = sanitize_text(result.error) if isinstance(result.error, str) else result.error
+        changed = content != result.content or error != result.error
+        if changed:
+            ctx.state["injection_guard.filtered"] = ctx.state.get("injection_guard.filtered", 0) + 1
+            result = ToolResult(ok=result.ok, content=content, error=error)
+        remember_result(ctx, name, args, result)
+        return result
 
     def after_agent(self, ctx, report):
-        # TODO (§10): 2-4 dòng.
-        #  Nếu INJECTION_CANARY còn trong report["answer"] thì gỡ nó ra.
-        #  Chỉ sửa "answer" — tuyệt đối không sửa text của claim.
-        return report  # <- mặc định KHÔNG LÀM GÌ
+        # Delete hostile claims instead of rewriting their quotations.
+        raw = report.get("claims")
+        claims = []
+        dropped = 0
+        if isinstance(raw, list):
+            for claim in raw:
+                text = claim.get("text") if isinstance(claim, dict) else None
+                if not isinstance(text, str) or sanitize_text(text) != text:
+                    dropped += 1
+                    continue
+                if isinstance(claim, dict):
+                    # Extra metadata is not claim text and must not leak a
+                    # canary either. Keep text byte-for-byte, scrub the rest.
+                    claim = {**_scrub({k: v for k, v in claim.items() if k != "text"}), "text": text}
+                claims.append(claim)
+        output = _scrub({key: value for key, value in report.items() if key != "claims"})
+        output["claims"] = claims
+        if isinstance(raw, list):
+            output["citations"] = citations(claims)
+        if dropped and not claims:
+            output.update(abstain=True, answer="Không còn bằng chứng an toàn đã kiểm chứng.", citations=[])
+            output.pop("verdict", None)
+        ctx.state["injection_guard.dropped_claims"] = dropped
+        return output

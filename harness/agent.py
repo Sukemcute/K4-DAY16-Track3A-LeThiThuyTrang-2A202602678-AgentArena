@@ -1,105 +1,24 @@
-"""The baseline ReAct agent — deliberately thin, deliberately weak.
+"""ReAct agent with bounded, evidence-driven FINAL review.
 
-STUDENT-OWNED. This is the agent you start from. It runs the loop, it
-routes every model call and every tool call through your middleware, and
-it writes a conforming trace. What it does NOT do is any of the five
-jobs the layers exist for: it never checks a citation, never notices a
-fabrication, never resists an injected instruction, never respects the
-tool budget, never retries a broken tool call. On the trap-spanning brief
-set it scores ~38 of 100 and it fails visibly, which is the point — every
-point above that is a layer you built.
+STUDENT-OWNED. The baseline loop remains available with adaptive=False
+or without a reviewing middleware. With Critic installed, the controller:
 
-WHAT YOU GET FOR FREE
-=====================
+* asks for retrieval before accepting an unsupported early FINAL;
+* bootstraps real search/fetch when the model skipped retrieval;
+* lets the model repair bad quotations, missing evidence or verdict;
+* reuses successful, sanitised read results and detects stalled loops;
+* retains a model-authored FINAL when resources prevent another repair.
 
-**The trace gate passes out of the box.** `run()` emits `agent_start`,
-one `model_call` per turn (with the tokens and the model's raw output
-text the scorer needs), and `agent_end`; `arena/tools.py` emits its own
-`tool_call` events. Keep using the harness and `Trace.validate` says
-`(True, "")` without you doing anything. Bypass it — call the model
-directly, hand-write JSONL — and the gate fails, which zeroes the entry.
-The gate is PASS/FAIL, never a scored dimension.
+All model calls still go through _call_model and the frozen runner. All
+real tool calls go through the normal middleware. No model/tool trace is
+fabricated. Parsing uses arena.model.parse_output with the scorer's
+canonicaliser; only raw model FINAL text supplies claim provenance.
+MAX_STEPS remains 40, after_agent runs once, and submit bypasses retry.
 
-**Your claims keep their provenance.** The report is extracted with
-`arena.model.parse_output`, the same frozen parser the scorer credits
-through, applied to the same canonicalised text. Do not swap in a
-friendlier parser of your own: a lenient one happily builds a
-plausible-looking report out of text the scorer will not recognise as a
-FINAL, and then EVERY claim scores `NOT_FROM_MODEL`. Measured cost of
-that mistake: a silent 40.15 instead of 92.52 — a run that looks perfect
-and scores like a troll.
-
-THE LOOP, IN ORDER
-==================
-
-    before_agent
-    repeat up to MAX_STEPS times:
-        messages_out = before_model(history)
-        response     = wrap_model_call(model.complete)(messages_out)
-        emit model_call(prompt_tokens, completion_tokens, output_text)
-        response     = after_model(response)
-        parsed       = parse_output(canonicalise(response.text))
-        if parsed is a FINAL:  break
-        result       = wrap_tool_call(dispatch)(tool, args)
-        history     += [assistant(response.text), user(observation)]
-    report = after_agent(parsed.final or {})
-    tools.submit(report)
-    emit agent_end
-
-`MAX_STEPS` is 40 and must not be lowered. Under a fully hostile tool
-layer the mock needs 31 model turns to reach a FINAL; a cap below that
-produces no report at all, silently, and only on the unlucky seeds.
-
-TWO THINGS THIS AGENT DOES ON PURPOSE, AND WHY
-==============================================
-
-1. `before_model` is applied to a COPY of the history, and only the raw
-   response and the raw observation are appended back. So a layer that
-   appends a one-turn nudge (`budget_policy`) nudges for one turn instead
-   of forever.
-2. `tools.submit()` is called directly, NOT through `wrap_tool_call`.
-   Submitting is the run's own bookkeeping rather than an action the
-   agent chose, and a `retry` layer that re-submitted would spend budget
-   the scorer counts (`tools.calls` includes `submit`) for nothing: a
-   timed-out submit still records the report verbatim on the trace.
-
-THE SYSTEM PROMPT THIS AGENT SENDS
-==================================
-
-`ARENA_SYSTEM_PROMPT` is frozen in `arena/model.py` and was written for
-`MockModel`, which is templated to always act. A real endpoint is not,
-and the difference was measured on live keys:
-
-    gpt-5.6-luna abstained on TURN 1 with ZERO tool calls on 4 of 6 runs
-    (contradiction 2/2, refund 2/2). Zero tools -> zero claims -> the
-    abstain floor -> a ladder with no gradient. deepseek-v4-flash: 0/6.
-
-So this module ships `REAL_MODEL_PROMPT_ADDENDUM` and the prompt that
-carries it, `ARENA_SYSTEM_PROMPT_REAL`. Nothing in `arena/` is unfrozen:
-the addendum is appended by student-owned code and handed to the agent
-through the keyword argument that already existed.
-
-    ReActAgent(model, tools, trace, system_prompt=ARENA_SYSTEM_PROMPT_REAL)
-
-**THE SCORED, REAL-MODEL PATH MUST CONSTRUCT THE AGENT THAT WAY.**
-
-The DEFAULT is still the bare frozen `ARENA_SYSTEM_PROMPT`, and that is a
-measured decision rather than caution. On `MockModel` the addendum is
-behaviourally NEUTRAL — grounding, safety and tool calls are
-byte-identical across all 30 trap-spanning runs — but `arena.model`
-estimates prompt tokens as `len(conversation) // 4`, so a 2,792-character
-addendum adds ~698 tokens to EVERY turn of a mock run and costs 1.28
-points of efficiency against the mock's 12,000-token budget (14.39 ->
-13.11), moving the practice ladder from 92.52 to 91.24. That is an
-artefact of the mock's estimator, not a real cost, and the practice
-ladder is a fixed acceptance artefact. Defaulting it off keeps the two
-paths honest: the mock ladder stays byte-identical, and the real path
-opts in explicitly.
-
-The ~700 prompt tokens per call ARE a real cost on a real endpoint, and
-the scored round's per-brief `max_tokens` is sized with them included. If
-you switch the addendum on, measure your own efficiency delta with
-`scripts/run_practice.py --prompt-addendum` before assuming it is free.
+The compact control policy applies automatically with a reviewer, also
+when the runner uses its default prompt. REAL_MODEL_PROMPT_ADDENDUM is
+an optional, more detailed protocol guide for real endpoints. Measure its
+additional token cost; it is not required to activate adaptive control.
 """
 
 from __future__ import annotations
@@ -115,6 +34,7 @@ from arena.model import (
 from arena.tools import ToolResult
 
 from harness.middleware import Middleware, MiddlewareStack
+from harness.control import RunController
 
 #: Hard ceiling on model turns. >= 40 is a REQUIREMENT, not a taste: with
 #: every tool call returning noise the mock needs 31 turns to reach its
@@ -471,11 +391,16 @@ class ReActAgent:
         corpus=None,
         max_steps: int = MAX_STEPS,
         system_prompt: str = ARENA_SYSTEM_PROMPT,
+        adaptive: bool | None = None,
     ) -> None:
         self.model = model
         self.tools = tools
         self.trace = trace
         self.middleware = MiddlewareStack(middleware)
+        # A plain/logging-only scaffold remains reproducible. Installing a
+        # final reviewer enables active repair; callers may opt out to measure
+        # the same safety layers with the original passive loop.
+        self.adaptive = self.middleware.has_final_review if adaptive is None else bool(adaptive)
         # The layers need the corpus to check a citation. `Tools` holds
         # one already, so a caller that does not pass one still works.
         self.corpus = corpus if corpus is not None else getattr(tools, "_corpus", None)
@@ -511,15 +436,26 @@ class ReActAgent:
             {"role": "user", "content": ctx.question},
         ]
         self.middleware.before_agent(ctx)
+        controller = RunController(ctx) if self.adaptive else None
+        ctx.state["agent.controller"] = controller
 
         report: dict = {}
+        model_turns = 0
         ctx.stop_reason = "max_steps"
         for step in range(self.max_steps):
-            ctx.step = step
+            if controller and controller.best is not None and not controller.can_continue():
+                report, ctx.stop_reason = controller.fallback(), "review_fallback"
+                break
 
-            outbound = self.middleware.before_model(ctx, list(ctx.messages))
+            ctx.step = step  # Count a turn only once it will call the model.
+
+            outbound = controller.outbound(list(ctx.messages)) if controller else list(ctx.messages)
+            outbound = self.middleware.before_model(ctx, outbound)
             response = self.middleware.wrap_model_call(ctx, self._call_model)(outbound)
+            model_turns += 1
             response = self.middleware.after_model(ctx, response)
+            if controller:
+                controller.account(response)
 
             text = getattr(response, "text", None)
             if not isinstance(text, str):
@@ -533,6 +469,19 @@ class ReActAgent:
 
             if parsed.kind == "final":
                 report = parsed.final if isinstance(parsed.final, dict) else {}
+                if controller:
+                    issues = self.middleware.review_final(ctx, report)
+                    retry_final = (step + 1 < self.max_steps
+                                   and controller.assess(report, issues))
+                    if retry_final:
+                        recovery = controller.recovery_action()
+                        if recovery:
+                            name, args = recovery
+                            controller.log("recovery_tool", tool=name)
+                            observation = self._execute_tool(ctx, name, args)
+                            ctx.observations.append(observation)
+                            ctx.messages.append({"role": "user", "content": observation})
+                        continue
                 ctx.stop_reason = "final"
                 break
 
@@ -540,7 +489,27 @@ class ReActAgent:
             ctx.observations.append(observation)
             ctx.messages.append({"role": "user", "content": observation})
 
-        if ctx.stop_reason != "final" and isinstance(self._refused_final, dict):
+            if controller:
+                continuation = controller.continuation_action()
+                while continuation:
+                    name, args = continuation
+                    observation = self._execute_tool(ctx, name, args)
+                    ctx.observations.append(observation)
+                    ctx.messages.append({"role": "user", "content": observation})
+                    continuation = controller.continuation_action()
+
+            if controller and controller.forcing and controller.stalls >= controller.MAX_STALLS + 2:
+                fallback = controller.fallback()
+                report = fallback if fallback is not None else {}
+                ctx.stop_reason = "review_fallback" if fallback is not None else "stalled_without_final"
+                break
+
+        if ctx.stop_reason == "max_steps" and controller:
+            fallback = controller.fallback()
+            if fallback is not None:
+                report, ctx.stop_reason = fallback, "review_fallback"
+
+        if ctx.stop_reason == "max_steps" and isinstance(self._refused_final, dict):
             # The loop ran out of steps and the only FINAL the model ever
             # wrote was one `_parse` put aside. Submit it: refusing bought
             # the model turns it did not use, and an empty report scores
@@ -556,7 +525,7 @@ class ReActAgent:
         # No `elapsed_seconds` here on purpose: a wall clock inside the
         # harness would make the trace non-deterministic, and the frozen
         # runner stamps its own `agent_end` with the timing it measured.
-        self.trace.emit("agent_end", stop_reason=ctx.stop_reason, steps=ctx.step + 1)
+        self.trace.emit("agent_end", stop_reason=ctx.stop_reason, steps=model_turns)
         return report
 
     # -- reading the model ---------------------------------------------
@@ -647,6 +616,9 @@ class ReActAgent:
         """Run one tool call through the `wrap_tool_call` chain and turn
         the result into the observation string the model is shown."""
         if parsed.kind != "action" or not parsed.tool:
+            controller = ctx.state.get("agent.controller")
+            if controller:
+                controller.stalled("unreadable_action")
             # Not a THOUGHT/ACTION turn and not a FINAL either. Say so
             # rather than guessing — a real model that drifts off the
             # protocol needs to be told, and the mock never gets here.
@@ -655,10 +627,33 @@ class ReActAgent:
                 "THOUGHT/ACTION hoặc THOUGHT/FINAL."
             )
 
-        call = self.middleware.wrap_tool_call(ctx, self._dispatch)
-        result = call(parsed.tool, dict(parsed.args))
+        return self._execute_tool(ctx, parsed.tool, dict(parsed.args))
+
+    def _execute_tool(self, ctx, name, args):
+        """One genuine tool dispatch, or reuse of an already observed result."""
+        controller = ctx.state.get("agent.controller")
+        if name == "search":
+            args = {**args, "query": _as_text(args.get("query")), "k": _as_k(args.get("k"))}
+        elif name == "fetch_doc":
+            args = {**args, "doc_id": _as_text(args.get("doc_id"))}
+        if controller and controller.forcing:
+            controller.stalled("ignored_finalize")
+            return f"{TOOL_ERROR_PREFIX} Dừng công cụ: viết FINAL từ bằng chứng đã đọc."
+        if controller:
+            from harness.layers._resources import finalizing, tool_budget_spent
+            if finalizing(ctx) or tool_budget_spent(ctx):
+                controller.forcing = True
+                return f"{TOOL_ERROR_PREFIX} Hết ngân sách truy xuất: viết FINAL ngay."
+        result = controller.cached(name, args) if controller else None
+        if result is None:
+            call = self.middleware.wrap_tool_call(ctx, self._dispatch)
+            result = call(name, args)
+            if controller and result is not None and hasattr(result, "ok"):
+                controller.result(name, args, result)
         if result is None or not hasattr(result, "ok"):
-            return f"{TOOL_ERROR_PREFIX} layer trả về kết quả không hợp lệ cho {parsed.tool}"
+            return f"{TOOL_ERROR_PREFIX} layer trả về kết quả không hợp lệ cho {name}"
+        if result.ok and not isinstance(result.content, str):
+            return f"{TOOL_ERROR_PREFIX} nội dung công cụ phải là chuỗi"
         return result.content if result.ok else f"{TOOL_ERROR_PREFIX} {result.error}"
 
     def _dispatch(self, name: str, args: dict) -> ToolResult:
@@ -680,7 +675,7 @@ def _as_text(value) -> str:
 def _as_k(value) -> int:
     try:
         k = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 5
     return max(1, min(MAX_SEARCH_K, k))
 

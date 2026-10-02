@@ -61,9 +61,36 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
-from arena.model import is_degraded  # noqa: F401  (dùng trong phần TODO)
+from arena.model import is_degraded
+from arena.tools import ToolResult
 
 from harness.middleware import Middleware
+from harness.layers._resources import finalizing, tool_budget_spent
+from harness.layers._evidence import json_payload
+
+_PERMANENT = ("doc not found:", "invalid expression:", "unknown tool:")
+
+
+def _broken(name, result):
+    if not result.ok or not isinstance(result.content, str) or is_degraded(result.content):
+        return True
+    if name == "fetch_doc":
+        return not result.content.strip()
+    if name == "search":
+        payload = json_payload(result.content)
+        return not isinstance(payload, list) or any(
+            not isinstance(row, dict) or not isinstance(row.get("doc_id"), str)
+            or not isinstance(row.get("snippet"), str) for row in payload
+        )
+    return False
+
+
+def _quality(name, result):
+    if not result.ok:
+        return 0
+    if not isinstance(result.content, str) or "[NOISE:" in result.content:
+        return 1
+    return 2 if _broken(name, result) else 3
 
 #: Tổng số lần thử, tính cả lần đầu.
 DEFAULT_MAX_ATTEMPTS = 3
@@ -86,16 +113,27 @@ class Retry(Middleware):
         self.reserve = max(0, int(reserve))
 
     def wrap_tool_call(self, ctx, call, name, args):
-        result = call(name, args)
-        # TODO (§7): khoảng 8-12 dòng.
-        #  1. Trong khi số lần đã thử < self.max_attempts VÀ kết quả còn
-        #     hỏng — tức `(not result.ok) or is_degraded(result.content)` —
-        #     thì gọi lại `call(name, args)` với ĐÚNG name/args cũ.
-        #  2. DỪNG THỬ LẠI khi ngân sách đã cạn: nếu
-        #     `ctx.max_tool_calls` khác None và
-        #     `ctx.tools.calls >= ctx.max_tool_calls - self.reserve`
-        #     thì đừng gọi thêm lượt nào nữa (xem phần cảnh báo ở trên).
-        #  3. Trả về kết quả cuối cùng (kể cả khi vẫn hỏng: agent phải
-        #     nhìn thấy sự thật, đừng bịa nội dung thay nó).
-        #  4. Ghi số lần đã thử vào ctx.state để gỡ lỗi.
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if finalizing(ctx) or tool_budget_spent(ctx, self.reserve):
+            return ToolResult(ok=False, content="", error="Hết ngân sách; dành lượt còn lại cho submit.")
+        original = dict(args) if isinstance(args, dict) else {}
+        result = call(name, dict(original))
+        best, attempts = result, 1
+        # Only the lab's read-only/idempotent operations are retryable.
+        # Never resubmit or repeatedly call an unknown side-effecting tool.
+        while name in {"search", "fetch_doc", "calc"} and attempts < self.max_attempts:
+            broken = _broken(name, result)
+            error = result.error if isinstance(result.error, str) else ""
+            if not broken or any(marker in error for marker in _PERMANENT):
+                break
+            if finalizing(ctx) or tool_budget_spent(ctx, self.reserve):
+                ctx.state["retry.budget_stops"] = ctx.state.get("retry.budget_stops", 0) + 1
+                break
+            result = call(name, dict(original))
+            attempts += 1
+            if _quality(name, result) >= _quality(name, best):
+                best = result
+        ctx.state["retry_attempts"] = ctx.state.get("retry_attempts", 0) + attempts - 1
+        ctx.state["retry.calls"] = ctx.state.get("retry.calls", 0) + 1
+        # Returning an earlier partial payload is preferable to losing it to
+        # a later timeout. This is still the exact result of a real tool call.
+        return best
